@@ -1,0 +1,274 @@
+-- ============================================================
+-- QUICKFEED INDEX OPTIMIZATION SCRIPT
+-- Vai trò: Database Administrator (DBA)
+-- Mục tiêu: Loại bỏ 3 index dư thừa, giải phóng tài nguyên
+-- ============================================================
+
+USE quickfeed_db;
+
+-- ============================================================
+-- BƯỚC 1: ĐO LƯỜNG DUNG LƯỢNG TRƯỚC KHI TỐI ƯU
+-- ============================================================
+
+-- Cách 1: Dùng SHOW TABLE STATUS
+SHOW TABLE STATUS LIKE 'Posts';
+
+-- Cách 2: Dùng information_schema (chi tiết hơn, đơn vị MB)
+SELECT 
+    TABLE_NAME,
+    ROUND(DATA_LENGTH / 1024 / 1024, 2)  AS Data_MB,
+    ROUND(INDEX_LENGTH / 1024 / 1024, 2) AS Index_MB,
+    ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024, 2) AS Total_MB,
+    ROUND(INDEX_LENGTH / NULLIF(DATA_LENGTH, 0), 2) AS Index_vs_Data_Ratio
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'quickfeed_db'
+  AND TABLE_NAME = 'Posts';
+
+-- ============================================================
+-- BƯỚC 2: KIỂM TRA CARDINALITY CỦA TỪNG INDEX
+-- ============================================================
+
+SHOW INDEX FROM Posts;
+
+-- ============================================================
+-- BƯỚC 3: XÓA 3 INDEX VÔ DỤNG
+-- ============================================================
+
+-- LỖI 1: Index trên cột TEXT gây phình to dung lượng
+ALTER TABLE Posts DROP INDEX idx_content;
+
+-- LỖI 2: Cardinality thấp (3 giá trị)
+ALTER TABLE Posts DROP INDEX idx_post_type;
+
+-- LỖI 3: Cardinality cực thấp (2 giá trị)
+ALTER TABLE Posts DROP INDEX idx_is_visible;
+
+-- ============================================================
+-- BƯỚC 4: ĐO LƯỜNG LẠI SAU KHI TỐI ƯU
+-- ============================================================
+
+SHOW TABLE STATUS LIKE 'Posts';
+
+SELECT 
+    TABLE_NAME,
+    ROUND(DATA_LENGTH / 1024 / 1024, 2)  AS Data_MB,
+    ROUND(INDEX_LENGTH / 1024 / 1024, 2) AS Index_MB,
+    ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024, 2) AS Total_MB,
+    ROUND(INDEX_LENGTH / NULLIF(DATA_LENGTH, 0), 2) AS Index_vs_Data_Ratio
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'quickfeed_db'
+  AND TABLE_NAME = 'Posts';
+
+-- ============================================================
+-- BƯỚC 5: KIỂM TRA LẠI DANH SÁCH INDEX
+-- ============================================================
+
+SHOW INDEX FROM Posts;
+-- Kết quả mong đợi: chỉ còn PRIMARY, idx_user_id, idx_created_at
+
+-- ============================================================
+-- BƯỚC 6 (TÙY CHỌN): THAY THẾ INDEX TEXT BẰNG FULLTEXT
+-- ============================================================
+
+-- Nếu cần tìm kiếm trong content, dùng FULLTEXT thay vì B-Tree
+-- ALTER TABLE Posts ADD FULLTEXT INDEX ft_content (content);
+
+-- Truy vấn tìm kiếm với FULLTEXT:
+-- SELECT * FROM Posts 
+-- WHERE MATCH(content) AGAINST('từ khóa' IN NATURAL LANGUAGE MODE);
+# Báo cáo Tối ưu hóa Index — Hệ thống QuickFeed
+
+## 1. Tóm tắt vấn đề
+
+Bảng `Posts` của hệ thống QuickFeed bị **over-indexing** nghiêm trọng do lập trình viên tập sự tạo index trên tất cả các cột. Hậu quả:
+- **INSERT chậm 5-10 giây** — người dùng bị timeout khi đăng bài.
+- **Dung lượng đĩa tăng gấp 3 lần** — Index length gấp đôi Data length.
+
+## 2. Nguyên nhân kỹ thuật
+
+### 2.1. Cơ chế ghi của InnoDB
+
+Khi INSERT 1 dòng mới, InnoDB không chỉ ghi dữ liệu vào **Clustered Index** (theo PK), mà còn phải **cập nhật tất cả Secondary Index** liên quan. Mỗi index là một **cây B-Tree** riêng biệt trên ổ cứng.
+
+**Trước tối ưu:** Bảng `Posts` có **6 index** (1 PK + 5 secondary):
+| # | Index | Loại |
+|---|-------|------|
+| 1 | PRIMARY (post_id) | Clustered |
+| 2 | idx_user_id | Secondary |
+| 3 | idx_content | Secondary (255 ký tự!) |
+| 4 | idx_post_type | Secondary |
+| 5 | idx_is_visible | Secondary |
+| 6 | idx_created_at | Secondary |
+
+→ Mỗi INSERT = **6 thao tác ghi B-Tree** → chậm.
+
+### 2.2. Vấn đề Cardinality
+
+**Cardinality** = số lượng giá trị **khác nhau** trong một cột. Cardinality càng **cao** → index càng hiệu quả.
+
+| Cột | Cardinality | Đánh giá |
+|-----|-------------|----------|
+| `post_id` | Rất cao (unique) | ✅ Tốt |
+| `user_id` | Cao (nhiều user) | ✅ Tốt |
+| `created_at` | Cao (mỗi giây khác) | ✅ Tốt |
+| `post_type` | Thấp (3 giá trị) | ❌ Kém |
+| `is_visible` | Cực thấp (2 giá trị) | ❌ Vô dụng |
+
+Với cột `is_visible = 1` chiếm **99%** dữ liệu, MySQL Optimizer sẽ **bỏ qua index** và **full table scan** vì:
+- Đọc index → tìm 99% dòng → rồi phải quay lại bảng gốc đọc dữ liệu (random I/O).
+- Full scan → đọc tuần tự toàn bảng (sequential I/O) → nhanh hơn.
+
+## 3. Giải pháp
+
+### 3.1. Decision Matrix
+
+| Index | Hành động | Lý do |
+|-------|-----------|-------|
+| `idx_user_id` | ✅ **GIỮ** | Cardinality cao, dùng load trang cá nhân |
+| `idx_content` | ❌ **XÓA** | Index TEXT tốn dung lượng; dùng FULLTEXT thay thế |
+| `idx_post_type` | ❌ **XÓA** | Cardinality thấp (3 giá trị) |
+| `idx_is_visible` | ❌ **XÓA** | Cardinality cực thấp (2 giá trị), full scan nhanh hơn |
+| `idx_created_at` | ✅ **GIỮ** | Cần cho sắp xếp newsfeed |
+
+### 3.2. Kết quả sau tối ưu
+
+| Chỉ số | Trước | Sau | Giảm |
+|--------|-------|-----|------|
+| Số index | 6 | 3 | **-50%** |
+| Thao tác ghi B-Tree / INSERT | 6 | 3 | **-50%** |
+| Index Length | Lớn (gấp đôi Data) | Nhỏ | **Giảm mạnh** |
+
+## 4. Đánh đổi Read vs Write
+
+| Yếu tố | Trước tối ưu | Sau tối ưu |
+|--------|--------------|------------|
+| **Write (INSERT)** | ❌ Chậm (6 B-Tree) | ✅ Nhanh (3 B-Tree) |
+| **Read (SELECT theo user_id)** | ✅ Nhanh | ✅ Nhanh (giữ idx_user_id) |
+| **Read (SELECT theo is_visible)** | ⚠️ Optimizer bỏ qua index | ⚠️ Full scan (không đổi) |
+| **Read (search content)** | ❌ Chậm + tốn disk | ✅ Có thể thêm FULLTEXT nếu cần |
+| **Storage** | ❌ Phình to | ✅ Gọn nhẹ |
+
+**Kết luận:** Việc xóa 3 index vô dụng **không làm chậm** các truy vấn Read quan trọng (vẫn giữ `idx_user_id` và `idx_created_at`), nhưng **tăng tốc đáng kể** thao tác Write và **giải phóng dung lượng đĩa**.
+
+## 5. Khuyến nghị
+
+1. **Giữ** `idx_user_id` và `idx_created_at`.
+2. **Xóa** `idx_content`, `idx_post_type`, `idx_is_visible`.
+3. Nếu cần tìm kiếm trong `content` → thêm **FULLTEXT index**:
+   ```sql
+   ALTER TABLE Posts ADD FULLTEXT INDEX ft_content (content);
+
+---
+
+## 📄 Bước 5: File `ai_prompt_log.md`
+
+```markdown
+# Nhật ký Tương tác AI — Bài thực hành Tối ưu hóa Index
+
+## 1. Khái niệm Cardinality
+
+**Câu hỏi:** "Cardinality là gì? Tại sao cột Giới tính (Nam/Nữ) lại là ứng cử viên tồi để tạo Index B-Tree?"
+
+**Trả lời tóm tắt từ AI:**
+- **Cardinality** là số lượng giá trị **khác nhau** trong một cột.
+- Cột `Giới tính` chỉ có 2 giá trị → cardinality = 2 (rất thấp).
+- Khi query `WHERE gender = 'Nam'` (giả sử 50% dữ liệu), MySQL Optimizer sẽ **bỏ qua index** và chọn **full table scan** vì:
+  - Đọc index → lấy 50% dòng → quay lại bảng gốc đọc dữ liệu (random I/O).
+  - Full scan → đọc tuần tự (sequential I/O) → nhanh hơn.
+- **Kết luận:** Index chỉ hữu ích khi cardinality **cao** (nhiều giá trị khác nhau).
+
+## 2. Tác hại của Index trên cột TEXT
+
+**Câu hỏi:** "Tại sao tạo Index trên cột TEXT lại tốn dung lượng khủng khiếp?"
+
+**Trả lời tóm tắt từ AI:**
+- Cột TEXT có thể chứa tới 65.535 ký tự.
+- Nếu tạo B-Tree index trên toàn bộ TEXT, mỗi node trong cây B-Tree phải lưu **toàn bộ 65KB** → cây phình to kinh khủng.
+- MySQL giới hạn bằng cách dùng **prefix index** — ví dụ `content(255)` chỉ index 255 ký tự đầu.
+- Nhưng ngay cả 255 ký tự cũng **rất lớn** so với INT (4 byte) → index vẫn tốn dung lượng.
+- **Giải pháp đúng:** Dùng **FULLTEXT index** — chuyên cho tìm kiếm văn bản, dùng **inverted index** thay vì B-Tree.
+
+## 3. Cách đo dung lượng bảng bằng information_schema
+
+**Câu hỏi:** "Làm sao in ra kích thước Data và Index của bảng Posts tính theo MB?"
+
+**Truy vấn AI gợi ý:**
+```sql
+SELECT 
+    TABLE_NAME,
+    ROUND(DATA_LENGTH / 1024 / 1024, 2)  AS Data_MB,
+    ROUND(INDEX_LENGTH / 1024 / 1024, 2) AS Index_MB,
+    ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024, 2) AS Total_MB
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'quickfeed_db'
+  AND TABLE_NAME = 'Posts';
+
+---
+
+## 📊 Bảng so sánh trước/sau tối ưu (cho báo cáo)
+
+| Chỉ số | Trước | Sau | Thay đổi |
+|--------|-------|-----|----------|
+| Số lượng Index | 6 | 3 | **-50%** |
+| Index ghi mỗi INSERT | 6 cây B-Tree | 3 cây B-Tree | **-50%** |
+| Thời gian INSERT | 5-10 giây | ~2-3 giây (ước tính) | **Nhanh hơn 2-3×** |
+| Index Length | Gấp đôi Data | Nhỏ gọn | **Giảm mạnh** |
+| Disk Usage | Phình to | Bình thường | **Tiết kiệm** |
+| Read theo user_id | Nhanh | Nhanh | **Không đổi** |
+| Read theo created_at | Nhanh | Nhanh | **Không đổi** |
+
+---
+
+## 🎓 Trả lời các câu hỏi vấn đáp của giảng viên
+
+### Câu 1: "Điều gì xảy ra ở tầng vật lý khi INSERT vào bảng có 5 index?"
+
+**Trả lời:**
+Khi INSERT 1 dòng mới, InnoDB phải:
+1. **Ghi dữ liệu thực** vào Clustered Index (cây B-Tree theo PK `post_id`).
+2. **Cập nhật 5 Secondary Index** — mỗi index là 1 cây B-Tree riêng:
+   - `idx_user_id` — chèn node mới
+   - `idx_content` — chèn node mới với 255 ký tự
+   - `idx_post_type` — chèn node mới
+   - `idx_is_visible` — chèn node mới
+   - `idx_created_at` — chèn node mới
+
+→ **Tổng cộng 6 thao tác ghi disk**. Mỗi thao tác phải tìm đúng vị trí trong cây B-Tree, có thể **split page** nếu node đầy → càng chậm.
+
+**Timeout:** Người dùng bấm "Đăng status" → ứng dụng chờ 5-10 giây → vượt quá timeout của HTTP request (thường 30 giây) → lỗi timeout.
+
+### Câu 2: "Cardinality là gì? Tại sao cột Giới tính là ứng cử viên tồi?"
+
+**Trả lời:**
+- **Cardinality** = số giá trị **khác nhau** trong cột.
+- Cột `Giới tính` chỉ có 2 giá trị → cardinality = 2 → rất thấp.
+- Khi query `WHERE gender = 'Nam'` (50% dữ liệu), MySQL sẽ **bỏ qua index** vì:
+  - Đọc index → lấy 50% dòng → quay lại bảng gốc (random I/O).
+  - Full scan → đọc tuần tự (sequential I/O) → nhanh hơn.
+- → Index vô dụng, chỉ tốn dung lượng và làm chậm INSERT.
+
+### Câu 3: "Nếu bảng Posts là Archive, không UPDATE/DELETE, hiếm INSERT, nhiều Index có còn tệ?"
+
+**Trả lời:**
+- **Không còn tệ như trước** — vì:
+  - Không có UPDATE/DELETE → không phải cập nhật index thường xuyên.
+  - Hiếm INSERT → chi phí ghi không đáng kể.
+- **Nhưng vẫn có nhược điểm:**
+  - **Tốn dung lượng đĩa** — index vẫn chiếm chỗ.
+  - **Tốn RAM** — buffer pool phải cache index.
+  - **Read có thể chậm hơn** — Optimizer phải cân nhắc nhiều index hơn.
+- **Kết luận:** Với bảng Archive, việc có nhiều index **ít gây hại hơn** so với bảng OLTP, nhưng vẫn nên **cân nhắc kỹ** dựa trên truy vấn thực tế.
+
+---
+
+## 📦 Tóm tắt 3 file cần nộp
+
+| # | File | Nội dung |
+|---|------|----------|
+| 1 | `quickfeed_index_optimization.sql` | Lệnh `information_schema` + `DROP INDEX` |
+| 2 | `storage_performance_report.md` | Báo cáo ~200 từ về trade-off Read/Write |
+| 3 | `ai_prompt_log.md` | Nhật ký tra cứu Cardinality + Storage với AI |
+
+---
+
+## 🏁 Tóm tắt quy trình thực hành
